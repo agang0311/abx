@@ -1,0 +1,529 @@
+#!/bin/bash
+# abx - Agent Browser 智能快捷命令工具
+# 自动管理 session，支持多并发隔离
+#
+# 用法: abx [command] [args...]
+# 管理命令: abx --list, abx --close <session>, abx --close-all, abx --cleanup
+
+set -e
+
+# 配置
+ABX_BASE_DIR="${HOME}/.openclaw/abx-sessions"
+ABX_BASE_PORT=9222
+ABX_MAX_PORT=9322
+ABX_LEGACY_PORT=9222  # 旧版 automation-chrome 端口
+ABX_SHARED_PORT=9222  # 共享 Chrome 端口（默认）
+
+mkdir -p "${ABX_BASE_DIR}/sessions"
+mkdir -p "${ABX_BASE_DIR}/chrome-data"
+mkdir -p "${ABX_BASE_DIR}/logs"
+
+# ============================================
+# 工具函数
+# ============================================
+
+# 获取当前 session ID
+get_session_id() {
+    # 优先级: ABX_SESSION_ID > OPENCLAW_SESSION_ID > 自动推断
+    if [ -n "$ABX_SESSION_ID" ]; then
+        echo "$ABX_SESSION_ID"
+    elif [ -n "$OPENCLAW_SESSION_ID" ]; then
+        echo "$OPENCLAW_SESSION_ID"
+    else
+        # 从进程树推断，生成稳定的 session ID
+        local ppid=$$
+        # 使用 PPID 链来唯一标识 session
+        local session_hash=$(ps -o ppid= -p $ppid 2>/dev/null | tr -d ' ' | md5sum | cut -c1-8)
+        echo "session_${session_hash}"
+    fi
+}
+
+# 查找可用的端口
+find_available_port() {
+    local port=$ABX_BASE_PORT
+    while [ $port -lt $ABX_MAX_PORT ]; do
+        if ! lsof -Pi :$port -sTCP:LISTEN -t >/dev/null 2>&1; then
+            echo $port
+            return 0
+        fi
+        ((port++))
+    done
+    echo "Error: No available port" >&2
+    return 1
+}
+
+# 检查是否是管理命令
+is_management_command() {
+    case "$1" in
+        --list|-l|--close|-c|--close-all|--cleanup|--help|-h)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# ============================================
+# 核心功能: 获取或创建 Session Chrome
+# ============================================
+
+get_or_create_session_chrome() {
+    local session_id=$1
+    local session_file="${ABX_BASE_DIR}/sessions/${session_id}.json"
+    
+    # 检查是否已有 Chrome
+    if [ -f "$session_file" ]; then
+        local port=$(jq -r '.port // empty' "$session_file" 2>/dev/null)
+        local pid=$(jq -r '.pid // empty' "$session_file" 2>/dev/null)
+        
+        # 验证 Chrome 是否还在运行
+        if [ -n "$port" ] && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            if lsof -Pi :$port -sTCP:LISTEN -t >/dev/null 2>&1; then
+                echo "$port"
+                return 0
+            fi
+        fi
+        
+        # Chrome 已死，清理
+        rm -f "$session_file"
+    fi
+    
+    # 检查 legacy automation-chrome (兼容旧版)
+    if [ "$session_id" = "legacy" ] || [ -z "$session_id" ]; then
+        if lsof -Pi :$ABX_LEGACY_PORT -sTCP:LISTEN -t >/dev/null 2>&1; then
+            echo "$ABX_LEGACY_PORT"
+            return 0
+        fi
+    fi
+    
+    # 创建新的 Chrome
+    local new_port=$(find_available_port)
+    local chrome_data_dir="${ABX_BASE_DIR}/chrome-data/${session_id}"
+    mkdir -p "$chrome_data_dir"
+    
+    # 自动应用保存的 Cookie（如果存在）
+    if [ -f "${ABX_BASE_DIR}/cookies-backup/latest" ]; then
+        ~/.openclaw/workspace/scripts/abx-cookie-manager.sh auto-apply "$session_id" 2>/dev/null || true
+    fi
+    
+    echo "[abx] Starting Chrome for session '${session_id}' on port ${new_port}..." >&2
+    
+    # 启动 Chrome
+    if [ -f "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ]; then
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+            --user-data-dir="$chrome_data_dir" \
+            --remote-debugging-port=$new_port \
+            --automation-for-testing \
+            --no-first-run \
+            --no-default-browser-check \
+            --window-size=1280,720 \
+            >"${ABX_BASE_DIR}/logs/${session_id}.log" 2>&1 &
+    else
+        # Linux 路径
+        google-chrome \
+            --user-data-dir="$chrome_data_dir" \
+            --remote-debugging-port=$new_port \
+            --automation-for-testing \
+            --no-first-run \
+            --no-default-browser-check \
+            --window-size=1280,720 \
+            >"${ABX_BASE_DIR}/logs/${session_id}.log" 2>&1 &
+    fi
+    
+    local chrome_pid=$!
+    
+    # 等待 Chrome 启动
+    local retries=0
+    while [ $retries -lt 30 ]; do
+        if lsof -Pi :$new_port -sTCP:LISTEN -t >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.5
+        ((retries++))
+    done
+    
+    # 保存 session 信息
+    cat > "$session_file" << EOF
+{
+  "session_id": "${session_id}",
+  "port": ${new_port},
+  "pid": ${chrome_pid},
+  "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "data_dir": "${chrome_data_dir}"
+}
+EOF
+    
+    echo "$new_port"
+}
+
+# ============================================
+# 管理命令
+# ============================================
+
+cleanup_dead_sessions() {
+    local sessions_dir="${ABX_BASE_DIR}/sessions"
+    [ -d "$sessions_dir" ] || return 0
+    
+    for session_file in "$sessions_dir"/*.json; do
+        [ -f "$session_file" ] || continue
+        local pid=$(jq -r '.pid // empty' "$session_file" 2>/dev/null)
+        if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+            local session_id=$(basename "$session_file" .json)
+            echo "[abx] Cleaning up dead session: ${session_id}" >&2
+            rm -f "$session_file"
+        fi
+    done
+}
+
+list_sessions() {
+    local sessions_dir="${ABX_BASE_DIR}/sessions"
+    
+    echo "Active abx sessions:"
+    echo "===================="
+    
+    # 显示共享 Chrome
+    local shared_file="${ABX_BASE_DIR}/sessions/shared.json"
+    if [ -f "$shared_file" ]; then
+        local port=$(jq -r '.port' "$shared_file")
+        local pid=$(jq -r '.pid' "$shared_file")
+        local status="✓ running"
+        if ! kill -0 "$pid" 2>/dev/null; then
+            status="✗ dead"
+        fi
+        printf "%-20s | Port: %-4s | Status: %-10s | Type: SHARED\n" \
+            "shared" "$port" "$status"
+        echo "--------------------"
+    fi
+    
+    # 显示隔离 sessions
+    local count=0
+    if [ -d "$sessions_dir" ]; then
+        for session_file in "$sessions_dir"/*.json; do
+            [ -f "$session_file" ] || continue
+            local session_id=$(jq -r '.session_id' "$session_file")
+            [ "$session_id" = "shared" ] && continue  # 跳过 shared
+            
+            ((count++))
+            local port=$(jq -r '.port' "$session_file")
+            local created_at=$(jq -r '.created_at' "$session_file")
+            local pid=$(jq -r '.pid' "$session_file")
+            
+            local status="✓ running"
+            if ! kill -0 "$pid" 2>/dev/null; then
+                status="✗ dead"
+            fi
+            
+            printf "%-20s | Port: %-4s | Status: %-10s | Type: ISOLATED\n" \
+                "$session_id" "$port" "$status"
+        done
+    fi
+    
+    if [ $count -eq 0 ] && [ ! -f "$shared_file" ]; then
+        echo "No active sessions"
+    else
+        echo "--------------------"
+        echo "Total: $((count + ($(test -f "$shared_file" && echo 1) || echo 0))) session(s)"
+        echo ""
+        echo "Mode:"
+        echo "  ISOLATED - 独立 Chrome（默认，互不干扰）"
+        echo "  SHARED   - 所有 session 共用（ABX_SHARED=1）"
+    fi
+}
+
+close_session() {
+    local session_id=$1
+    local session_file="${ABX_BASE_DIR}/sessions/${session_id}.json"
+    
+    if [ -f "$session_file" ]; then
+        local pid=$(jq -r '.pid' "$session_file")
+        echo "[abx] Closing session '${session_id}' (PID: ${pid})..."
+        kill "$pid" 2>/dev/null || true
+        sleep 1
+        kill -9 "$pid" 2>/dev/null || true
+        rm -f "$session_file"
+        echo "Closed"
+    else
+        echo "Session '${session_id}' not found"
+        return 1
+    fi
+}
+
+close_all_sessions() {
+    local sessions_dir="${ABX_BASE_DIR}/sessions"
+    [ -d "$sessions_dir" ] || { echo "No smart sessions to close"; return 0; }
+    
+    local count=0
+    for session_file in "$sessions_dir"/*.json; do
+        [ -f "$session_file" ] || continue
+        local session_id=$(basename "$session_file" .json)
+        close_session "$session_id" 2>/dev/null || true
+        ((count++))
+    done
+    
+    # 同时关闭 legacy
+    if lsof -Pi :$ABX_LEGACY_PORT -sTCP:LISTEN -t >/dev/null 2>&1; then
+        echo "[abx] Closing legacy automation-chrome..."
+        pkill -f "Chrome.*automation-chrome" 2>/dev/null || true
+    fi
+    
+    echo "Closed $count session(s)"
+}
+
+show_help() {
+    cat << 'EOF'
+abx - Agent Browser 智能快捷命令工具
+
+【隔离模式 vs 共享模式】
+
+  隔离模式（默认）                    共享模式（需指定 ABX_SHARED=1）
+  ─────────────────────────────────   ─────────────────────────────────
+  • 每个 session 独立的 Chrome        • 所有 session 共用 1 个 Chrome
+  • 互不干扰，适合并发操作            • 省内存，但会互相覆盖页面
+  • 多账号场景推荐                    • 单人简单任务可用
+  • 端口 9223-9322（动态分配）        • 端口 9222（固定）
+
+  Session A ──→ Chrome A (9223)       Session A ──┐
+  Session B ──→ Chrome B (9224)       Session B ──┼──→ Chrome (9222)
+  Session C ──→ Chrome C (9225)       Session C ──┘
+
+  【注意】Cookie 在两种模式下都从中央仓库自动注入，都能自动登录
+
+用法:
+  abx <command> [args...]           - 执行命令（默认隔离模式）
+  abx --shared <command> [args...]  - 使用共享模式
+  abx --list                        - 列出所有活跃 session
+  abx --close <session_id>          - 关闭指定 session
+  abx --close-all                   - 关闭所有 session
+  abx --cleanup                     - 清理死掉的 session
+  abx --help                        - 显示帮助
+
+常用命令:
+  abx open <url>                    - 打开网页（自动注入 Cookie）
+  abx snapshot                      - 获取页面快照
+  abx click @<ref>                  - 点击元素
+  abx fill @<ref> "text"            - 填充表单
+  abx screenshot [path]             - 截图
+  abx get title                     - 获取页面标题
+  abx get url                       - 获取当前 URL
+
+环境变量:
+  ABX_SHARED=1                      - 使用共享模式（默认是隔离模式）
+  ABX_SESSION_ID=<name>             - 指定 session 名称
+
+示例:
+  # 隔离模式（默认）- 推荐用于多账号/并发场景
+  abx open https://x.com/home
+  ABX_SESSION_ID="bot-1" abx open https://x.com
+  ABX_SESSION_ID="bot-2" abx open https://x.com  # 完全独立，互不干扰
+
+  # 共享模式 - 用于单人省内存场景
+  ABX_SHARED=1 abx open https://x.com
+  abx --shared open https://github.com
+
+  # 管理 sessions
+  abx --list
+  abx --close session_abc123
+  abx --close-all
+
+特点:
+  ✓ 默认隔离模式，互不干扰（推荐）
+  ✓ 可选共享模式，省内存
+  ✓ 全自动 Cookie 管理（两种模式都支持）
+  ✓ 支持 100 个并发 session
+
+文档:
+  ~/.openclaw/workspace/docs/abx-design.md
+  ~/.openclaw/workspace/docs/abx-complete-guide.md
+EOF
+}
+
+# ============================================
+# 共享 Chrome 管理（需 ABX_SHARED=1）
+# ============================================
+
+ensure_shared_chrome() {
+    # 检查是否已有共享 Chrome
+    local shared_file="${ABX_BASE_DIR}/sessions/shared.json"
+    
+    if [ -f "$shared_file" ]; then
+        local port=$(jq -r '.port // empty' "$shared_file" 2>/dev/null)
+        local pid=$(jq -r '.pid // empty' "$shared_file" 2>/dev/null)
+        
+        if [ -n "$port" ] && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            if lsof -Pi :$port -sTCP:LISTEN -t >/dev/null 2>&1; then
+                echo "$port"
+                return 0
+            fi
+        fi
+        rm -f "$shared_file"
+    fi
+    
+    # 检查 legacy automation-chrome
+    if lsof -Pi :$ABX_SHARED_PORT -sTCP:LISTEN -t >/dev/null 2>&1; then
+        # 已有 legacy，直接使用
+        local legacy_pid=$(lsof -Pi :$ABX_SHARED_PORT -sTCP:LISTEN -t | head -1)
+        cat > "$shared_file" << EOF
+{
+  "session_id": "shared",
+  "port": $ABX_SHARED_PORT,
+  "pid": $legacy_pid,
+  "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "data_dir": "${HOME}/.openclaw/automation-chrome"
+}
+EOF
+        echo "$ABX_SHARED_PORT"
+        return 0
+    fi
+    
+    # 启动新的共享 Chrome
+    echo "[abx] Starting shared Chrome on port ${ABX_SHARED_PORT}..." >&2
+    
+    local shared_data_dir="${ABX_BASE_DIR}/chrome-data/shared"
+    mkdir -p "$shared_data_dir"
+    
+    if [ -f "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ]; then
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+            --user-data-dir="$shared_data_dir" \
+            --remote-debugging-port=$ABX_SHARED_PORT \
+            --automation-for-testing \
+            --no-first-run \
+            --no-default-browser-check \
+            --window-size=1280,720 \
+            >"${ABX_BASE_DIR}/logs/shared.log" 2>&1 &
+    else
+        google-chrome \
+            --user-data-dir="$shared_data_dir" \
+            --remote-debugging-port=$ABX_SHARED_PORT \
+            --automation-for-testing \
+            --no-first-run \
+            --no-default-browser-check \
+            --window-size=1280,720 \
+            >"${ABX_BASE_DIR}/logs/shared.log" 2>&1 &
+    fi
+    
+    local chrome_pid=$!
+    
+    # 等待启动
+    local retries=0
+    while [ $retries -lt 30 ]; do
+        if lsof -Pi :$ABX_SHARED_PORT -sTCP:LISTEN -t >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.5
+        ((retries++))
+    done
+    
+    cat > "$shared_file" << EOF
+{
+  "session_id": "shared",
+  "port": $ABX_SHARED_PORT,
+  "pid": $chrome_pid,
+  "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "data_dir": "${shared_data_dir}"
+}
+EOF
+    
+    echo "$ABX_SHARED_PORT"
+}
+
+# ============================================
+# 主逻辑
+# ============================================
+
+main() {
+    # 处理管理命令
+    case "${1:-}" in
+        --list|-l)
+            list_sessions
+            exit 0
+            ;;
+        --close|-c)
+            close_session "${2:-}"
+            exit 0
+            ;;
+        --close-all)
+            close_all_sessions
+            exit 0
+            ;;
+        --cleanup)
+            cleanup_dead_sessions
+            echo "Cleanup complete"
+            exit 0
+            ;;
+        --help|-h)
+            show_help
+            exit 0
+            ;;
+        --shared)
+            # 共享模式：所有 session 共用 Chrome
+            shift
+            export ABX_SHARED=1
+            ;;
+    esac
+    
+    # 清理死掉的 session
+    cleanup_dead_sessions
+    
+    # 判断模式
+    if [ -n "$ABX_SHARED" ]; then
+        # 【共享模式】所有 session 共享 Chrome（省内存，但可能冲突）
+        port=$(ensure_shared_chrome)
+        echo "[abx] Using shared Chrome (port: ${port}) - all sessions share this browser" >&2
+    else
+        # 【默认模式】每个 session 独立的 Chrome（推荐，互不干扰）
+        local session_id=$(get_session_id)
+        port=$(get_or_create_session_chrome "$session_id")
+        echo "[abx] Using isolated Chrome for session '${session_id}' (port: ${port})" >&2
+    fi
+    
+    # 连接到 Chrome
+    agent-browser connect "$port" 2>/dev/null
+    sleep 0.3
+    
+    # 执行命令（带自动 Cookie 管理）
+    if [ $# -gt 0 ]; then
+        local cmd="$1"
+        shift
+        
+        # 自动 Cookie 管理
+        case "$cmd" in
+            open|goto|navigate)
+                local url="${1:-}"
+                # 打开前：注入 Cookie
+                if [ -n "$url" ]; then
+                    ~/.openclaw/workspace/scripts/abx-cookie-auto.sh before-open "$port" "$url" 2>/dev/null || true
+                fi
+                
+                # 执行打开
+                agent-browser "$cmd" "$@"
+                
+                # 打开后：等待页面加载，检查登录状态
+                sleep 2
+                if [ -n "$url" ]; then
+                    local login_status=$(~/.openclaw/workspace/scripts/abx-cookie-auto.sh check "$port" "$url" 2>/dev/null || echo "unknown")
+                    if [ "$login_status" = "logged_in" ]; then
+                        echo "[abx] ✓ Logged in (using stored cookies)" >&2
+                        # 后台异步保存最新 Cookie
+                        (~/.openclaw/workspace/scripts/abx-cookie-auto.sh sync-now "$port" 2>/dev/null &) 
+                    elif [ "$login_status" = "not_logged_in" ]; then
+                        echo "[abx] ⚠ Not logged in, please login manually" >&2
+                    fi
+                fi
+                ;;
+            close|quit|exit)
+                # 关闭前：保存 Cookie
+                ~/.openclaw/workspace/scripts/abx-cookie-auto.sh on-close "$port" 2>/dev/null || true
+                agent-browser "$cmd" "$@"
+                ;;
+            *)
+                # 其他命令直接执行
+                agent-browser "$cmd" "$@"
+                ;;
+        esac
+    else
+        show_help
+    fi
+}
+
+main "$@"

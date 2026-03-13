@@ -1,0 +1,32 @@
+# Cookie 仓库（包含敏感信息）
+.cookie-repo/
+cookie-repo/
+
+# Session 数据
+.sessions/
+sessions/
+
+# 日志文件
+*.log
+logs/
+
+# 截图
+*.png
+*.jpg
+*.jpeg
+
+# 临时文件
+*.tmp
+*.bak
+*.backup
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Node
+node_modules/
