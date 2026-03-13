@@ -44,6 +44,10 @@ abx click @e5
 
 # 截图
 abx screenshot result.png
+
+# 无头模式（后台运行）
+ABX_HEADLESS=1 abx open https://x.com
+abx --headless open https://x.com
 ```
 
 ## 📖 文档
@@ -83,6 +87,14 @@ ABX_SESSION_ID="bot-2" abx open https://x.com
 
 # 共享模式
 ABX_SHARED=1 abx open https://x.com
+
+# 无头模式（后台运行，无窗口）
+ABX_HEADLESS=1 abx open https://x.com
+abx --headless open https://x.com
+
+# 无头 + 隔离 + 多账号
+ABX_HEADLESS=1 ABX_SESSION_ID="bot-1" abx open https://x.com
+ABX_HEADLESS=1 ABX_SESSION_ID="bot-2" abx open https://x.com
 ```
 
 ### 后台同步
