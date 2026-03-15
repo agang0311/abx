@@ -24,19 +24,32 @@ mkdir -p "${ABX_BASE_DIR}/logs"
 
 # 获取当前 session ID
 get_session_id() {
-    # 优先级: ABX_SESSION_ID > OPENCLAW_SESSION_ID > 自动推断
+    # 优先级 1: 手动指定
     if [ -n "$ABX_SESSION_ID" ]; then
         echo "$ABX_SESSION_ID"
-    elif [ -n "$OPENCLAW_SESSION_ID" ]; then
-        echo "$OPENCLAW_SESSION_ID"
-    else
-        # 从进程树推断，生成稳定的 session ID
-        local ppid=$$
-        # 使用 PPID 链来唯一标识 session
-        local session_hash=$(ps -o ppid= -p $ppid 2>/dev/null | tr -d ' ' | md5sum | cut -c1-8)
-        echo "session_${session_hash}"
+        return
     fi
+    
+    # 优先级 2: 平台 + 类型 + ID（多平台自动识别）
+    if [ -n "$OPENCLAW_CHANNEL_ID" ]; then
+        local platform="${OPENCLAW_PLATFORM:-unknown}"
+        local chat_type="${OPENCLAW_CHAT_TYPE:-channel}"
+        echo "${platform}-${chat_type}-${OPENCLAW_CHANNEL_ID}"
+        return
+    fi
+    
+    # 优先级 3: OpenClaw Session ID
+    if [ -n "$OPENCLAW_SESSION_ID" ]; then
+        echo "$OPENCLAW_SESSION_ID"
+        return
+    fi
+    
+    # 优先级 4: 进程树推断（备用）
+    local ppid=$$
+    local session_hash=$(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ' | md5sum | cut -c1-8)
+    echo "session_${session_hash}"
 }
+
 
 # 查找可用的端口
 find_available_port() {
