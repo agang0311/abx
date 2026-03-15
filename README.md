@@ -95,6 +95,10 @@ abx --headless open https://x.com
 # 无头 + 隔离 + 多账号
 ABX_HEADLESS=1 ABX_SESSION_ID="bot-1" abx open https://x.com
 ABX_HEADLESS=1 ABX_SESSION_ID="bot-2" abx open https://x.com
+
+# 自动识别频道（OpenClaw 集成）
+# 每个 Discord 频道自动获得独立 Chrome
+# 无需手动指定 SESSION_ID
 ```
 
 ### 后台同步

@@ -223,7 +223,9 @@ list_sessions() {
         echo "No active sessions"
     else
         echo "--------------------"
-        echo "Total: $((count + ($(test -f "$shared_file" && echo 1) || echo 0))) session(s)"
+        local shared_count=0
+        [ -f "$shared_file" ] && shared_count=1
+        echo "Total: $((count + shared_count)) session(s)"
         echo ""
         echo "Mode:"
         echo "  ISOLATED - 独立 Chrome（默认，互不干扰）"
